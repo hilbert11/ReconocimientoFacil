@@ -1,107 +1,192 @@
 import cv2
-import dlib
+import mediapipe as mp
 import numpy as np
 from scipy.spatial import distance
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
 import time
+import platform
 
-# --- Landmark predictor ---
-PREDICTOR_PATH = "shape_predictor_68_face_landmarks.dat"
-detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor(PREDICTOR_PATH)
+# --- Sonido ---
+if platform.system() == "Windows":
+    import winsound
+    def beep():
+        winsound.Beep(1000, 500)
+else:
+    def beep():
+        print('\a')  # beep simple en consola
 
-# --- Índices para ojos y boca ---
-LEFT_EYE = [36, 37, 38, 39, 40, 41]
-RIGHT_EYE = [42, 43, 44, 45, 46, 47]
-MOUTH = [60, 61, 62, 63, 64, 65, 66, 67]
+# --- Inicializar Mediapipe ---
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
 
-# --- Umbrales ---
+# --- Funciones EAR / MAR / Pose ---
+def eye_aspect_ratio(eye_landmarks, frame_w, frame_h):
+    coords = [(int(landmark.x * frame_w), int(landmark.y * frame_h)) for landmark in eye_landmarks]
+    A = distance.euclidean(coords[1], coords[5])
+    B = distance.euclidean(coords[2], coords[4])
+    C = distance.euclidean(coords[0], coords[3])
+    ear = (A + B) / (2.0 * C) if C != 0 else 0
+    return ear, coords
+
+def mouth_aspect_ratio(mouth_landmarks, frame_w, frame_h):
+    coords = [(int(landmark.x * frame_w), int(landmark.y * frame_h)) for landmark in mouth_landmarks]
+    A = distance.euclidean(coords[2], coords[3])
+    C = distance.euclidean(coords[0], coords[1])
+    mar = A / C if C != 0 else 0
+    return mar, coords
+
+def head_pose_estimation(face_landmarks, frame_w, frame_h):
+    image_points = np.array([
+        (face_landmarks.landmark[1].x * frame_w, face_landmarks.landmark[1].y * frame_h),
+        (face_landmarks.landmark[152].x * frame_w, face_landmarks.landmark[152].y * frame_h),
+        (face_landmarks.landmark[33].x * frame_w, face_landmarks.landmark[33].y * frame_h),
+        (face_landmarks.landmark[263].x * frame_w, face_landmarks.landmark[263].y * frame_h),
+        (face_landmarks.landmark[61].x * frame_w, face_landmarks.landmark[61].y * frame_h),
+        (face_landmarks.landmark[291].x * frame_w, face_landmarks.landmark[291].y * frame_h)
+    ], dtype="double")
+
+    model_points = np.array([
+        (0.0, 0.0, 0.0),
+        (0.0, -63.6, -12.5),
+        (-43.3, 32.7, -26.0),
+        (43.3, 32.7, -26.0),
+        (-28.9, -28.9, -24.1),
+        (28.9, -28.9, -24.1)
+    ])
+
+    focal_length = frame_w
+    center = (frame_w / 2, frame_h / 2)
+    camera_matrix = np.array([[focal_length, 0, center[0]],
+                              [0, focal_length, center[1]],
+                              [0, 0, 1]], dtype="double")
+    dist_coeffs = np.zeros((4, 1))
+
+    success, rotation_vector, translation_vector = cv2.solvePnP(
+        model_points, image_points, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE)
+
+    rotation_mat, _ = cv2.Rodrigues(rotation_vector)
+    pose_mat = cv2.hconcat((rotation_mat, translation_vector))
+    _, _, _, _, _, _, euler_angles = cv2.decomposeProjectionMatrix(pose_mat)
+    pitch, yaw, roll = [angle[0] for angle in euler_angles]
+    return pitch, yaw, roll
+
+# --- Mostrar alerta interactiva ---
+def mostrar_alerta(frame, mensaje="⚠ Pausa activa recomendada!"):
+    h, w, _ = frame.shape
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (50, 100), (w-50, 200), (0, 0, 255), -1)
+    alpha = 0.6
+    frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+    cv2.putText(frame, mensaje, (60, 170), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+    cv2.imshow("Deteccion Estrés / Fatiga / Somnolencia", frame)
+    beep()
+    while True:
+        # Detectar cierre con X
+        if cv2.getWindowProperty("Deteccion Estrés / Fatiga / Somnolencia", cv2.WND_PROP_VISIBLE) < 1:
+            break
+        key = cv2.waitKey(1) & 0xFF
+        if key in [13, 27]:  # Enter o ESC
+            break
+
+# --- Landmarks ---
+LEFT_EYE = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+MOUTH = [61, 291, 13, 14, 17]
+
+# --- Parámetros ---
 EAR_THRESH = 0.25
 CLOSED_FRAMES = 15
 MAR_THRESH = 0.6
 PITCH_THRESH = 15
+
 VENTANA_TIEMPO = 15  # segundos
-UMBRAL_EVENTOS = 10
+UMBRAL_EVENTOS = 100
+eventos = []
 
-# --- Funciones EAR/MAR ---
-def eye_aspect_ratio(eye_points):
-    A = distance.euclidean(eye_points[1], eye_points[5])
-    B = distance.euclidean(eye_points[2], eye_points[4])
-    C = distance.euclidean(eye_points[0], eye_points[3])
-    return (A + B) / (2.0 * C) if C != 0 else 0
+tiempo_ultimo_chequeo = time.time()
 
-def mouth_aspect_ratio(mouth_points):
-    A = distance.euclidean(mouth_points[2], mouth_points[6])
-    C = distance.euclidean(mouth_points[0], mouth_points[4])
-    return A / C if C != 0 else 0
+# --- Variables ---
+frame_counter = 0
+fatiga_detectada = False
 
-# --- Video processor ---
-class VideoProcessor(VideoTransformerBase):
-    def __init__(self):
-        self.frame_counter = 0
-        self.fatiga_detectada = False
-        self.eventos = []
-        self.tiempo_ultimo_chequeo = time.time()
+# --- Video ---
+cap = cv2.VideoCapture(0)
 
-    def transform(self, frame):
-        img = frame.to_ndarray(format="bgr24")
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        ahora = time.time()
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
 
-        estado = "Normal"
-        color = (0, 255, 0)
+    h, w, _ = frame.shape
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = face_mesh.process(rgb_frame)
 
-        faces = detector(gray)
-        for face in faces:
-            landmarks = predictor(gray, face)
-            points = np.array([[p.x, p.y] for p in landmarks.parts()])
-
+    ahora = time.time()
+    if results.multi_face_landmarks:
+        for face_landmarks in results.multi_face_landmarks:
             # Ojos
-            left_eye = points[LEFT_EYE]
-            right_eye = points[RIGHT_EYE]
-            ear_avg = (eye_aspect_ratio(left_eye) + eye_aspect_ratio(right_eye)) / 2.0
+            left_eye_landmarks = [face_landmarks.landmark[i] for i in LEFT_EYE]
+            right_eye_landmarks = [face_landmarks.landmark[i] for i in RIGHT_EYE]
+            left_ear, left_coords = eye_aspect_ratio(left_eye_landmarks, w, h)
+            right_ear, right_coords = eye_aspect_ratio(right_eye_landmarks, w, h)
+            ear_avg = (left_ear + right_ear) / 2.0
+            for (x, y) in left_coords + right_coords:
+                cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
 
             # Boca
-            mar = mouth_aspect_ratio(points[MOUTH])
+            mouth_landmarks = [face_landmarks.landmark[i] for i in MOUTH]
+            mar, mouth_coords = mouth_aspect_ratio(mouth_landmarks, w, h)
+            for (x, y) in mouth_coords:
+                cv2.circle(frame, (x, y), 2, (255, 0, 0), -1)
 
-            # Fatiga por ojos
+            # Cabeza
+            pitch, yaw, roll = head_pose_estimation(face_landmarks, w, h)
+
+            # Detección ojos (fatiga)
             if ear_avg < EAR_THRESH:
-                self.frame_counter += 1
+                frame_counter += 1
             else:
-                self.frame_counter = 0
-                self.fatiga_detectada = False
-            if self.frame_counter >= CLOSED_FRAMES:
-                self.fatiga_detectada = True
+                frame_counter = 0
+                fatiga_detectada = False
+            if frame_counter >= CLOSED_FRAMES:
+                fatiga_detectada = True
 
-            # Eventos
-            if self.fatiga_detectada and mar > MAR_THRESH:
+            # Lógica combinada
+            estado = "Normal"
+            color = (0, 255, 0)
+
+            if fatiga_detectada and mar > MAR_THRESH:
                 estado = "Bostezo detectado (Cansancio)"
                 color = (255, 0, 0)
-                self.eventos.append(ahora)
-            elif self.fatiga_detectada:
+                eventos.append(ahora)
+            elif fatiga_detectada:
                 estado = "Fatiga detectada!"
                 color = (0, 0, 255)
-                self.eventos.append(ahora)
+                eventos.append(ahora)
             elif mar > MAR_THRESH:
                 estado = "Boca abierta (Estrés/Bostezo)"
                 color = (0, 255, 255)
-                self.eventos.append(ahora)
+                eventos.append(ahora)
+            elif pitch > PITCH_THRESH:
+                estado = "Cabeceo detectado (Somnolencia)"
+                color = (128, 0, 255)
+                eventos.append(ahora)
 
-        # Revisión ventana de tiempo
-        if ahora - self.tiempo_ultimo_chequeo >= VENTANA_TIEMPO:
-            conteo = sum(1 for t in self.eventos if t >= self.tiempo_ultimo_chequeo)
-            if conteo >= UMBRAL_EVENTOS:
-                estado = "⚠ Pausa activa recomendada!"
-                color = (0, 0, 255)
-            self.tiempo_ultimo_chequeo = ahora
-            self.eventos = [t for t in self.eventos if ahora - t <= VENTANA_TIEMPO]
+            cv2.putText(frame, estado, (50, 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
 
-        cv2.putText(img, estado, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
-        return img
+    # --- Revisar ventana de tiempo ---
+    if ahora - tiempo_ultimo_chequeo >= VENTANA_TIEMPO:
+        conteo = sum(1 for t in eventos if t >= tiempo_ultimo_chequeo)
+        if conteo >= UMBRAL_EVENTOS:
+            mostrar_alerta(frame)
+        tiempo_ultimo_chequeo = ahora
+        eventos = [t for t in eventos if ahora - t <= VENTANA_TIEMPO]
 
-# --- Streamlit WebRTC ---
-webrtc_streamer(
-    key="tesis_dlib",
-    video_processor_factory=VideoProcessor,
-    media_stream_constraints={"video": True, "audio": False}
-)
+    cv2.imshow("Deteccion Estrés / Fatiga / Somnolencia", frame)
+
+    # Salir con ESC o con la X
+    if cv2.waitKey(1) & 0xFF == 27 or cv2.getWindowProperty("Deteccion Estrés / Fatiga / Somnolencia", cv2.WND_PROP_VISIBLE) < 1:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
