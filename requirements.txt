@@ -1,6 +1,7 @@
 streamlit
 streamlit-webrtc
 opencv-python
-dlib
+mediapipe
 numpy
 scipy
+gradio
